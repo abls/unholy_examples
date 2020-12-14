@@ -14,26 +14,26 @@
 // (just search strings)
 //
 
-#define OFF_HELLO 0x1750
+#define OFF_HELLO 0x17D0
 
-#define OFF_HACKED_CDECL        0x11B0
-#define OFF_HACKED_CDECL_RTN64  0x1210
-#define OFF_HACKED_CDECL_RTNFLT 0x1300
-#define OFF_HACKED_CDECL_RTNDBL 0x1280
+#define OFF_HACKED_CDECL        0x1540
+#define OFF_HACKED_CDECL_RTN64  0x1580
+#define OFF_HACKED_CDECL_RTNFLT 0x15D0
+#define OFF_HACKED_CDECL_RTNDBL 0x1B70
 
-#define OFF_HACKED_STDCALL        0x1580
-#define OFF_HACKED_STDCALL_RTN64  0x15E0
-#define OFF_HACKED_STDCALL_RTNFLT 0x16D0
-#define OFF_HACKED_STDCALL_RTNDBL 0x1650
+#define OFF_HACKED_STDCALL        0x1700
+#define OFF_HACKED_STDCALL_RTN64  0x1740
+#define OFF_HACKED_STDCALL_RTNFLT 0x17E0
+#define OFF_HACKED_STDCALL_RTNDBL 0x1790
 
-#define OFF_HACKED_FASTCALL        0x1380
-#define OFF_HACKED_FASTCALL_RTN64  0x13F0
-#define OFF_HACKED_FASTCALL_RTNFLT 0x14F0
-#define OFF_HACKED_FASTCALL_RTNDBL 0x1460
+#define OFF_HACKED_FASTCALL        0x1620
+#define OFF_HACKED_FASTCALL_RTN64  0x1660
+#define OFF_HACKED_FASTCALL_RTNFLT 0x27B0
+#define OFF_HACKED_FASTCALL_RTNDBL 0x16B0
 
-#define OFF_CALLER_CDECL 0x1000
-#define OFF_CALLER_STDCALL 0x1120
-#define OFF_CALLER_FASTCALL 0x1090
+#define OFF_CALLER_CDECL 0x1420
+#define OFF_CALLER_STDCALL 0x14B0
+#define OFF_CALLER_FASTCALL 0x1470
 
 //
 // --- END OFFSETS
@@ -80,7 +80,6 @@ int __fastcall callback_fastcall(HANDLE rmt_handle, double n) {
 	return 888;
 }
 
-
 int main() {
 	printf("About to begin demo...\n\n");
 
@@ -97,6 +96,13 @@ int main() {
 	int hacked_cdecl_rtnval = hacked_cdecl(message, 666);
 	printf("hacked_cdecl_rtnval: %d\n", hacked_cdecl_rtnval);
 
+	try {
+		hacked_cdecl_rtnval = hacked_cdecl(0, 666);
+	} catch (...) {
+		hacked_cdecl_rtnval = 123;
+		printf("CAUGHT hacked_cdecl_rtnval: %d\n", hacked_cdecl_rtnval);
+	}
+
 	hacked_cdeclRtn64_t hacked_cdeclRtn64 = Bridges::createBridgeRmt<hacked_cdeclRtn64_t>(rmt_handle, img_base_addr + OFF_HACKED_CDECL_RTN64, TFUNC_CDECL_RTN64, BRIDGE_ARGS(char*, __int64));
 	__int64 hacked_cdeclRtn64_rtnval = hacked_cdeclRtn64(message, 666);
 	printf("hacked_cdeclRtn64_rtnval: %lld\n", hacked_cdeclRtn64_rtnval);
@@ -108,6 +114,34 @@ int main() {
 	hacked_cdeclRtnDbl_t hacked_cdeclRtnDbl = Bridges::createBridgeRmt<hacked_cdeclRtnDbl_t>(rmt_handle, img_base_addr + OFF_HACKED_CDECL_RTNDBL, TFUNC_CDECL_RTNDBL, BRIDGE_ARGS(char*, double));
 	double hacked_cdeclRtnDbl_rtnval = hacked_cdeclRtnDbl(message, 666);
 	printf("hacked_cdeclRtnDbl_rtnval: %lf\n", hacked_cdeclRtnDbl_rtnval);
+
+	try {
+		hacked_cdecl_rtnval = hacked_cdecl(0, 666);
+	} catch (...) {
+		hacked_cdecl_rtnval = 123;
+		printf("CAUGHT hacked_cdecl_rtnval: %d\n", hacked_cdecl_rtnval);
+	}
+
+	try {
+		hacked_cdeclRtn64_rtnval = hacked_cdeclRtn64(0, 666);
+	} catch (...) {
+		hacked_cdeclRtn64_rtnval = 123;
+		printf("CAUGHT hacked_cdeclRtn64_rtnval: %lld\n", hacked_cdeclRtn64_rtnval);
+	}
+
+	try {
+		hacked_cdeclRtnFlt_rtnval = hacked_cdeclRtnFlt(0, 666);
+	} catch (...) {
+		hacked_cdeclRtnFlt_rtnval = 123;
+		printf("CAUGHT hacked_cdeclRtnFlt_rtnval: %f\n", hacked_cdeclRtnFlt_rtnval);
+	}
+
+	try {
+		hacked_cdeclRtnDbl_rtnval = hacked_cdeclRtnDbl(0, 666);
+	} catch (...) {
+		hacked_cdeclRtnDbl_rtnval = 123;
+		printf("CAUGHT hacked_cdeclRtnDbl_rtnval: %lf\n", hacked_cdeclRtnDbl_rtnval);
+	}
 
 	///////////////////
 	// STDCALL DEMOS //
@@ -129,6 +163,34 @@ int main() {
 	double hacked_stdcallRtnDbl_rtnval = hacked_stdcallRtnDbl(message, 666);
 	printf("hacked_stdcallRtnDbl_rtnval: %lf\n", hacked_stdcallRtnDbl_rtnval);
 
+	try {
+		hacked_stdcall_rtnval = hacked_stdcall(0, 666);
+	} catch (...) {
+		hacked_stdcall_rtnval = 123;
+		printf("CAUGHT hacked_stdcall_rtnval: %d\n", hacked_stdcall_rtnval);
+	}
+
+	try {
+		hacked_stdcallRtn64_rtnval = hacked_stdcallRtn64(0, 666);
+	} catch (...) {
+		hacked_stdcallRtn64_rtnval = 123;
+		printf("CAUGHT hacked_stdcallRtn64_rtnval: %lld\n", hacked_stdcallRtn64_rtnval);
+	}
+
+	try {
+		hacked_stdcallRtnFlt_rtnval = hacked_stdcallRtnFlt(0, 666);
+	} catch (...) {
+		hacked_stdcallRtnFlt_rtnval = 123;
+		printf("CAUGHT hacked_stdcallRtnFlt_rtnval: %f\n", hacked_stdcallRtnFlt_rtnval);
+	}
+
+	try {
+		hacked_stdcallRtnDbl_rtnval = hacked_stdcallRtnDbl(0, 666);
+	} catch (...) {
+		hacked_stdcallRtnDbl_rtnval = 123;
+		printf("CAUGHT hacked_stdcallRtnDbl_rtnval: %lf\n", hacked_stdcallRtnDbl_rtnval);
+	}
+
 	////////////////////
 	// FASTCALL DEMOS //
 	////////////////////
@@ -149,11 +211,39 @@ int main() {
 	double hacked_fastcallRtnDbl_rtnval = hacked_fastcallRtnDbl(message, 666, 520420);
 	printf("hacked_fastcallRtnDbl_rtnval: %lf\n", hacked_fastcallRtnDbl_rtnval);
 
+	try {
+		hacked_fastcall_rtnval = hacked_fastcall(0, 666, 520420);
+	} catch (...) {
+		hacked_fastcall_rtnval = 123;
+		printf("CAUGHT hacked_fastcall_rtnval: %d\n", hacked_fastcall_rtnval);
+	}
+
+	try {
+		hacked_fastcallRtn64_rtnval = hacked_fastcallRtn64(0, 666, 520420);
+	} catch (...) {
+		hacked_fastcallRtn64_rtnval = 123;
+		printf("CAUGHT hacked_fastcallRtn64_rtnval: %lld\n", hacked_fastcallRtn64_rtnval);
+	}
+
+	try {
+		hacked_fastcallRtnFlt_rtnval = hacked_fastcallRtnFlt(0, 666, 520420);
+	} catch (...) {
+		hacked_fastcallRtnFlt_rtnval = 123;
+		printf("CAUGHT hacked_fastcallRtnFlt_rtnval: %f\n", hacked_fastcallRtnFlt_rtnval);
+	}
+
+	try {
+		hacked_fastcallRtnDbl_rtnval = hacked_fastcallRtnDbl(0, 666, 520420);
+	} catch (...) {
+		hacked_fastcallRtnDbl_rtnval = 123;
+		printf("CAUGHT hacked_fastcallRtnDbl_rtnval: %lf\n", hacked_fastcallRtnDbl_rtnval);
+	}
+
 	////////////////////
 	// CALLBACK DEMOS //
 	////////////////////
 
-	caller_cdecl_t caller_cdecl = Bridges::createBridgeRmt<caller_cdecl_t>(rmt_handle, img_base_addr + OFF_CALLER_CDECL, TFUNC_CDECL, BRIDGE_ARGS(void*));
+	/*caller_cdecl_t caller_cdecl = Bridges::createBridgeRmt<caller_cdecl_t>(rmt_handle, img_base_addr + OFF_CALLER_CDECL, TFUNC_CDECL, BRIDGE_ARGS(void*));
 	void* rmt_callback_cdecl = Bridges::createBridgeLocal(rmt_handle, callback_cdecl, TFUNC_CDECL, BRIDGE_ARGS(double));
 	int caller_cdecl_rtnval = caller_cdecl(rmt_callback_cdecl);
 	printf("caller_cdecl_rtnval: %d\n", caller_cdecl_rtnval);
@@ -166,7 +256,7 @@ int main() {
 	caller_fastcall_t caller_fastcall = Bridges::createBridgeRmt<caller_fastcall_t>(rmt_handle, img_base_addr + OFF_CALLER_FASTCALL, TFUNC_FASTCALL, BRIDGE_ARGS(void*));
 	void* rmt_callback_fastcall = Bridges::createBridgeLocal(rmt_handle, callback_fastcall, TFUNC_FASTCALL, BRIDGE_ARGS(double));
 	int caller_fastcall_rtnval = caller_fastcall(rmt_callback_fastcall);
-	printf("caller_fastcall_rtnval: %d\n", caller_fastcall_rtnval);
+	printf("caller_fastcall_rtnval: %d\n", caller_fastcall_rtnval);*/
 
 	printf("\nDemo complete!\n");
 	Sleep(INFINITE);

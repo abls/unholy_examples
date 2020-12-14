@@ -35,5 +35,11 @@
     <ClInclude Include="..\..\deps\unholy\win32memory.hpp">
       <Filter>Unholy Files</Filter>
     </ClInclude>
+    <ClInclude Include="win64bridges.hpp">
+      <Filter>Unholy Files</Filter>
+    </ClInclude>
+    <ClInclude Include="win64memory.hpp">
+      <Filter>Unholy Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

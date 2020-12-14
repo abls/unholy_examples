@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdio.h>
 
 #include "win32bridges.hpp"
 #include "win32memory.hpp"
@@ -21,13 +22,23 @@ typedef BOOL(WINAPI* ReadProcessMemory_t)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_
 typedef BOOL(WINAPI* WriteProcessMemory_t)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T);
 typedef HANDLE(WINAPI* CreateRemoteThread_t)(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, void*, LPVOID, DWORD, LPDWORD);
 typedef DWORD(WINAPI* WaitForSingleObject_t)(HANDLE, DWORD);
+typedef BOOL (WINAPI* GetExitCodeThread_t)(HANDLE, LPDWORD);
+//
+typedef LPTOP_LEVEL_EXCEPTION_FILTER(WINAPI* SetUnhandledExceptionFilter_t)(LPTOP_LEVEL_EXCEPTION_FILTER);
+typedef PVOID(WINAPI* AddVectoredContinueHandler_t)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+typedef ULONG(WINAPI* RemoveVectoredContinueHandler_t)(PVOID);
+typedef VOID(WINAPI* RaiseException_t)(DWORD, DWORD, DWORD, ULONG_PTR*);
 
 // Struct used by probe functions to call target functions.
 typedef struct ProbeParameters {
 	void* target_func;
 	int arg_info;
-	void** argdata; // TODO: rename to arg_data // TODO: I mean... make this an int pointer? 
+	void** argdata; // TODO: rename to arg_data // TODO: I mean... make this an int pointer?
 	void* rtnval_addr;
+
+	SetUnhandledExceptionFilter_t fnSetUnhandledExceptionFilter;
+	AddVectoredContinueHandler_t fnAddVectoredContinueHandler;
+	RemoveVectoredContinueHandler_t fnRemoveVectoredContinueHandler;
 } ProbeParameters;
 
 // Struct that gets used by bridge functions so that they have context of how to read args and how to call the target function.
@@ -50,6 +61,11 @@ typedef struct BridgeData {
 	WriteProcessMemory_t fnWriteProcessMemory;
 	CreateRemoteThread_t fnCreateRemoteThread;
 	WaitForSingleObject_t fnWaitForSingleObject;
+	GetExitCodeThread_t fnGetExitCodeThread;
+	SetUnhandledExceptionFilter_t fnSetUnhandledExceptionFilter;
+	AddVectoredContinueHandler_t fnAddVectoredContinueHandler;
+	RemoveVectoredContinueHandler_t fnRemoveVectoredContinueHandler;
+	RaiseException_t fnRaiseException;
 } BridgeData;
 
 // If you are curious about how arg_info is encoded...
@@ -89,8 +105,18 @@ __declspec(naked) DWORD WINAPI probeCdecl_ptbl(LPVOID) {
 		mov ebp, esp
 		push ebx
 
-		// Load important data from the ProbeParameters struct arg into various registers
+		// Load ProbeParameters struct arg into working register
 		mov ebx, [ebp + 8] // probe_params
+
+		// Setup unhandled EH
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3 // size of pop eax, jmp short
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
+		// Load important data from the ProbeParameters struct arg into various registers
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -120,6 +146,42 @@ __declspec(naked) DWORD WINAPI probeCdecl_ptbl(LPVOID) {
 		mov [ecx], eax
 		noret:
 
+		// Set probe return value to zero, goto cleanup
+		xor eax, eax
+		jmp short handlerloop_end
+
+		// Used during handler setup to get the address of the handler
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		// unhandled EH -> Check if exception code is c++ exception. If yes then set probe return value to 1, then clear stack until sentinel value is hit. If no then continue search (crash).
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363 // Check for c++ exception code
+		je short handler_start
+		mov eax, 0  // EXCEPTION_CONTINUE_SEARCH
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		// Remove unhandled EH
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		// Restore registers, clean up stack, and return
 		pop ebx
 		pop ebp
@@ -135,6 +197,14 @@ __declspec(naked) DWORD WINAPI probeCdeclRtn64_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3 // size of pop eax, jmp short
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -160,6 +230,38 @@ __declspec(naked) DWORD WINAPI probeCdeclRtn64_ptbl(LPVOID) {
 		mov [ecx + 4], edx // since this is 64-bit return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363 // Check for c++ exception code
+		je short handler_start
+		mov eax, 0  // EXCEPTION_CONTINUE_SEARCH
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -174,6 +276,14 @@ __declspec(naked) DWORD WINAPI probeCdeclRtnFlt_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3 // size of pop eax, jmp short
+		push eax
+		call[ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -198,6 +308,38 @@ __declspec(naked) DWORD WINAPI probeCdeclRtnFlt_ptbl(LPVOID) {
 		fstp dword ptr [ecx] // since this is a float return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363 // Check for c++ exception code
+		je short handler_start
+		mov eax, 0  // EXCEPTION_CONTINUE_SEARCH
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -212,6 +354,14 @@ __declspec(naked) DWORD WINAPI probeCdeclRtnDbl_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3 // size of pop eax, jmp short
+		push eax
+		call[ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -236,6 +386,38 @@ __declspec(naked) DWORD WINAPI probeCdeclRtnDbl_ptbl(LPVOID) {
 		fstp qword ptr [ecx] // since this is a double return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -250,6 +432,14 @@ __declspec(naked) DWORD WINAPI probeStdcall_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -272,6 +462,38 @@ __declspec(naked) DWORD WINAPI probeStdcall_ptbl(LPVOID) {
 		mov [ecx], eax
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -286,6 +508,14 @@ __declspec(naked) DWORD WINAPI probeStdcallRtn64_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -307,6 +537,38 @@ __declspec(naked) DWORD WINAPI probeStdcallRtn64_ptbl(LPVOID) {
 		mov [ecx + 4], edx // since this is 64-bit return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -321,6 +583,14 @@ __declspec(naked) DWORD WINAPI probeStdcallRtnFlt_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -341,6 +611,38 @@ __declspec(naked) DWORD WINAPI probeStdcallRtnFlt_ptbl(LPVOID) {
 		fstp dword ptr [ecx] // since this is a float return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -355,6 +657,14 @@ __declspec(naked) DWORD WINAPI probeStdcallRtnDbl_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov ecx, [ebx]ProbeParameters.arg_info
 		and ecx, 0xff // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
@@ -375,6 +685,38 @@ __declspec(naked) DWORD WINAPI probeStdcallRtnDbl_ptbl(LPVOID) {
 		fstp qword ptr [ecx] // since this is a double return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 8]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop ebp
 		ret 4
@@ -390,8 +732,16 @@ __declspec(naked) DWORD WINAPI probeFastcall_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
+		and esi, 0xff                          // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
 
 		mov edi, [ebx]ProbeParameters.arg_info
@@ -434,6 +784,38 @@ __declspec(naked) DWORD WINAPI probeFastcall_ptbl(LPVOID) {
 		je short noret
 		mov [ecx], eax
 		noret:
+
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 16]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
 
 		pop ebx
 		pop edi
@@ -452,8 +834,16 @@ __declspec(naked) DWORD WINAPI probeFastcallRtn64_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
+		and esi, 0xff                          // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
 
 		mov edi, [ebx]ProbeParameters.arg_info
@@ -498,6 +888,38 @@ __declspec(naked) DWORD WINAPI probeFastcallRtn64_ptbl(LPVOID) {
 		mov [ecx + 4], edx // since this is 64-bit return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 16]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop edi
 		pop esi
@@ -515,8 +937,16 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnFlt_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
+		and esi, 0xff                          // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
 
 		mov edi, [ebx]ProbeParameters.arg_info
@@ -560,6 +990,38 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnFlt_ptbl(LPVOID) {
 		fstp dword ptr [ecx] // since this is a float return value
 		noret:
 
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 16]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
+
 		pop ebx
 		pop edi
 		pop esi
@@ -577,8 +1039,16 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 		push ebx
 
 		mov ebx, [ebp + 8] // probe_params
+
+		jmp short handler_setup_helper
+		handler_setup_continue:
+		add eax, 3
+		push eax
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		push 0xDEADD007
+
 		mov esi, [ebx]ProbeParameters.arg_info // have to use esi/edi since I can't mess with value in ecx before the call because it is fastcall
-		and esi, 0xff // get nslots from arg_info
+		and esi, 0xff                          // get nslots from arg_info
 		mov eax, [ebx]ProbeParameters.argdata
 
 		mov edi, [ebx]ProbeParameters.arg_info
@@ -621,6 +1091,38 @@ __declspec(naked) DWORD WINAPI probeFastcallRtnDbl_ptbl(LPVOID) {
 		je short noret
 		fstp qword ptr [ecx] // since this is a double return value
 		noret:
+
+		xor eax, eax
+		jmp short handlerloop_end
+
+		handler_setup_helper:
+		call $+5
+		pop eax
+		jmp short handler_setup_continue
+
+		mov eax, [esp + 4]
+		mov eax, [eax]
+		mov eax, [eax]
+		cmp eax, 0xE06D7363
+		je short handler_start
+		mov eax, 0
+		ret
+		handler_start:
+		mov eax, 1
+		handlerloop_start:
+		cmp dword ptr [esp], 0xDEADD007
+		je short handlerloop_end
+		add esp, 4
+		jmp short handlerloop_start
+		handlerloop_end:
+
+		lea ebp, [esp + 16]
+		add esp, 4
+		push eax
+		push 0
+		mov ebx, [ebp + 8]
+		call [ebx]ProbeParameters.fnSetUnhandledExceptionFilter
+		pop eax
 
 		pop ebx
 		pop edi
@@ -671,6 +1173,7 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	int rtn_value;
 
 	// Address of BridgeData struct to be patched in when function is copied
@@ -722,6 +1225,11 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	// Set up the probe params struct to know the address of the allocated space for the return value, and store so that the retval can be read once the rmt function returns
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	// Add the addresses of necessary winapi funcs to the probe params struct
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+	local_probe_params->fnAddVectoredContinueHandler = bridge_data->fnAddVectoredContinueHandler;
+	local_probe_params->fnRemoveVectoredContinueHandler = bridge_data->fnRemoveVectoredContinueHandler;
+
 	// Store the address of the allocated space for the rmt probe params and then copy the local struct to rmt
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
@@ -737,6 +1245,50 @@ __declspec(naked) void* __cdecl bridgeCdecl_ptbl() {
 	// Create new remote thread starting on the remote probe function, pass the address of the remote ProbeParameters struct to the remote probe function
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	// Check for error
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		// Free all left over allocated space
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0 // Pointer to RTTI descriptor for type
+			push 1 // 1 = simple type // start of _CatchableType
+
+			mov ebx, esp
+			push 1   // number of types in array
+			push ebx // Pointer to first _CatchableType in array // start of _CatchableTypeArray
+
+			lea eax, [ebx - 8]
+			push eax // Pointer to _CatchableTypeArray
+			push 0
+			push 0
+			push 0   // start of _ThrowInfo
+
+			push 666 // thrown object
+
+			lea eax, [ebx - 24]
+			push eax          // Pointer to _ThrowInfo
+			lea eax, [ebx - 28]
+			push eax            // Pointer to thrown object
+			push 0x19930520 // start of exception argument array for RaiseException
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	// Retrieve return value from remote process
 	rtn_value = 0;
@@ -778,6 +1330,7 @@ __declspec(naked) void* __stdcall bridgeCdeclRtn64_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -817,6 +1370,8 @@ __declspec(naked) void* __stdcall bridgeCdeclRtn64_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -829,6 +1384,48 @@ __declspec(naked) void* __stdcall bridgeCdeclRtn64_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
@@ -870,6 +1467,7 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnFlt_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	int rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -909,6 +1507,8 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnFlt_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -921,6 +1521,48 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnFlt_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
@@ -960,6 +1602,7 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnDbl_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -999,6 +1642,8 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnDbl_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1011,6 +1656,48 @@ __declspec(naked) void* __stdcall bridgeCdeclRtnDbl_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
@@ -1049,6 +1736,7 @@ __declspec(naked) void* __stdcall bridgeStdcall_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	int rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1088,6 +1776,8 @@ __declspec(naked) void* __stdcall bridgeStdcall_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1100,6 +1790,48 @@ __declspec(naked) void* __stdcall bridgeStdcall_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
@@ -1156,6 +1888,7 @@ __declspec(naked) void* __stdcall bridgeStdcallRtn64_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1195,6 +1928,8 @@ __declspec(naked) void* __stdcall bridgeStdcallRtn64_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1207,6 +1942,48 @@ __declspec(naked) void* __stdcall bridgeStdcallRtn64_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
@@ -1264,6 +2041,7 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnFlt_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	int rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1303,6 +2081,8 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnFlt_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1315,6 +2095,48 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnFlt_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
@@ -1369,6 +2191,7 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnDbl_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1408,6 +2231,8 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnDbl_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1420,6 +2245,48 @@ __declspec(naked) void* __stdcall bridgeStdcallRtnDbl_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
@@ -1479,6 +2346,7 @@ __declspec(naked) void* __fastcall bridgeFastcall_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	int rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1558,6 +2426,8 @@ __declspec(naked) void* __fastcall bridgeFastcall_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1570,6 +2440,48 @@ __declspec(naked) void* __fastcall bridgeFastcall_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
@@ -1630,6 +2542,7 @@ __declspec(naked) void* __fastcall bridgeFastcallRtn64_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1709,6 +2622,8 @@ __declspec(naked) void* __fastcall bridgeFastcallRtn64_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1721,6 +2636,48 @@ __declspec(naked) void* __fastcall bridgeFastcallRtn64_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
@@ -1783,6 +2740,7 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnFlt_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -1862,6 +2820,8 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnFlt_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 4);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -1874,6 +2834,48 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnFlt_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 4, 0);
@@ -1934,6 +2936,7 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnDbl_ptbl() {
 	void* rmt_probe_params;
 	void* rmt_probe_func;
 	HANDLE rmt_thread_handle;
+	DWORD rmt_thread_exit_code;
 	__int64 rtn_value;
 
 	__asm mov bridge_data, 0xBAADB00F
@@ -2013,6 +3016,8 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnDbl_ptbl() {
 
 	local_probe_params->rtnval_addr = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size);
 
+	local_probe_params->fnSetUnhandledExceptionFilter = bridge_data->fnSetUnhandledExceptionFilter;
+
 	rmt_probe_params = reinterpret_cast<void*>(reinterpret_cast<uint32_t>(rmt_allocated_chonk) + argdata_size + 8);
 	bridge_data->fnWriteProcessMemory(bridge_data->rmt_handle, rmt_probe_params, local_probe_params, sizeof(ProbeParameters), 0);
 
@@ -2025,6 +3030,48 @@ __declspec(naked) void* __fastcall bridgeFastcallRtnDbl_ptbl() {
 
 	rmt_thread_handle = bridge_data->fnCreateRemoteThread(bridge_data->rmt_handle, 0, 0, rmt_probe_func, rmt_probe_params, 0, 0);
 	bridge_data->fnWaitForSingleObject(rmt_thread_handle, INFINITE);
+
+	bridge_data->fnGetExitCodeThread(rmt_thread_handle, &rmt_thread_exit_code);
+	if (rmt_thread_exit_code) {
+		bridge_data->fnVirtualFreeEx(bridge_data->rmt_handle, rmt_allocated_chonk, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_params, 0, MEM_RELEASE);
+		bridge_data->fnVirtualFree(local_probe_argdata, 0, MEM_RELEASE);
+
+		__asm {
+			push 0
+			push 4
+			push 0
+			push - 1
+			push 0
+			push 0
+			push 1
+
+			mov ebx, esp
+			push 1
+			push ebx
+
+			lea eax, [ebx - 8]
+			push eax
+			push 0
+			push 0
+			push 0
+
+			push 666
+
+			lea eax, [ebx - 24]
+			push eax
+			lea eax, [ebx - 28]
+			push eax
+			push 0x19930520
+
+			push esp
+			push 3
+			push 1
+			push 0xE06D7363
+			mov ebx, bridge_data
+			call [ebx]BridgeData.fnRaiseException
+		}
+	}
 
 	rtn_value = 0;
 	bridge_data->fnReadProcessMemory(bridge_data->rmt_handle, local_probe_params->rtnval_addr, &rtn_value, 8, 0);
@@ -2209,7 +3256,12 @@ void* Bridges::_createBridge(HANDLE rmt_handle, void* target_func, int func_type
 		reinterpret_cast<ReadProcessMemory_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "ReadProcessMemory")),
 		reinterpret_cast<WriteProcessMemory_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WriteProcessMemory")),
 		reinterpret_cast<CreateRemoteThread_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "CreateRemoteThread")),
-		reinterpret_cast<WaitForSingleObject_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WaitForSingleObject"))
+		reinterpret_cast<WaitForSingleObject_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "WaitForSingleObject")),
+		reinterpret_cast<GetExitCodeThread_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "GetExitCodeThread")),
+		reinterpret_cast<SetUnhandledExceptionFilter_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "SetUnhandledExceptionFilter")),
+		reinterpret_cast<AddVectoredContinueHandler_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "AddVectoredExceptionHandler")),
+		reinterpret_cast<RemoveVectoredContinueHandler_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "RemoveVectoredExceptionHandler")),
+		reinterpret_cast<RaiseException_t>(GetProcAddress(GetModuleHandle("kernel32.dll"), "RaiseException"))
 	};
 
 	// Length of the bridge function and copy of the bridge function in either local or rmt process depending on if the bridge is reversed
